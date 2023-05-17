@@ -1619,7 +1619,6 @@ class QuantumService(Service, metaclass=ABCMeta):
     
     # ################################################################################################################################
     
-    @abstractmethod
     def before_circuit_execution(self, _zato_no_op_marker=zato_no_op_marker, *args, **kwargs): # type: ignore
         """ Invoked just before the actual service executes the quantum circuit.
         """
