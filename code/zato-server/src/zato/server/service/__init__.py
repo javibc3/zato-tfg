@@ -7,12 +7,24 @@ Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
 
 # stdlib
+from abc import ABCMeta, abstractmethod
 import logging
+from contextlib import closing
 from datetime import datetime, timedelta
 from http.client import BAD_REQUEST, METHOD_NOT_ALLOWED
 from inspect import isclass
 from traceback import format_exc
 from typing import Optional as optional
+
+# Amazon Braket SDK
+from braket.circuits.circuit import Circuit
+from braket.aws.aws_device import AwsDevice, AwsSession
+from braket.tasks.gate_model_quantum_task_result import GateModelQuantumTaskResult
+from braket.tasks.annealing_quantum_task_result import AnnealingQuantumTaskResult
+from braket.tasks.photonic_model_quantum_task_result import PhotonicModelQuantumTaskResult
+
+# Boto3
+from boto3 import Session
 
 # Bunch
 from bunch import bunchify
@@ -28,6 +40,13 @@ from gevent.lock import RLock
 # Python 2/3 compatibility
 from zato.common.py23_ import maxint
 
+#Qiskit
+from qiskit import QuantumCircuit, transpile
+from qiskit.result import Result
+from qiskit.providers.exceptions import QiskitBackendNotFoundError
+from qiskit_ibm_provider import IBMProvider
+from qiskit_ibm_provider.job.exceptions import IBMJobTimeoutError, IBMJobFailureError
+
 # Zato
 from zato.bunch import Bunch
 from zato.common.api import BROKER, CHANNEL, DATA_FORMAT, HL7, KVDB, NO_DEFAULT_VALUE, PARAMS_PRIORITY, PUBSUB, \
@@ -36,7 +55,7 @@ from zato.common.broker_message import CHANNEL as BROKER_MSG_CHANNEL
 from zato.common.exception import Inactive, Reportable, ZatoException
 from zato.common.json_internal import dumps
 from zato.common.json_schema import ValidationException as JSONSchemaValidationException
-from zato.common.typing_ import cast_
+from zato.common.typing_ import any_, cast_
 from zato.common.util.api import make_repr, new_cid, payload_from_request, service_name_from_impl, spawn_greenlet, uncamelify
 from zato.server.commands import CommandsFacade
 from zato.server.connection.cache import CacheAPI
@@ -52,6 +71,7 @@ from zato.server.pattern.api import ParallelExec
 from zato.server.pubsub import PubSub
 from zato.server.service.reqresp import AMQPRequestData, Cloud, Definition, HL7API, HL7RequestData, IBMMQRequestData, \
      InstantMessaging, Outgoing, Request
+from zato.common.odb.model import SecurityBase
 
 # Zato - Cython
 from zato.cy.reqresp.payload import SimpleIOPayload
@@ -1381,6 +1401,358 @@ class Service:
 
         return service
 
+# ################################################################################################################################
+
+class QuantumService(Service, metaclass=ABCMeta):
+    """ 
+    A base class for all quantum services deployed on Zato servers for defining quantum services in Zato. \n
+    All its subclasses must implement at least the :mod:`circuit` and :mod:`after_circuit_execution` methods. \n
+    If synchronization logic it's needed before or after the circuit execution, it can be specified in the methods :mod:`before_circuit_execution` and :mod:`after_circuit_exectuion`respectively.
+    """
+
+    circuit_result : 'GateModelQuantumTaskResult | AnnealingQuantumTaskResult | PhotonicModelQuantumTaskResult'
+
+    def get_key(self):
+        """ 
+        Returns key from zato security vault using the specified name that will be used to authenticate to the cloud provider. \n
+        By default it will be used 'default'
+        """
+        name = getattr(self.__class__, 'key_name', 'default')
+
+        with closing(self.odb.session()) as session:
+            query = session.query(
+            SecurityBase.id,
+            SecurityBase.name,
+            SecurityBase.username,
+            SecurityBase.password).\
+            filter(SecurityBase.cluster_id==self.server.cluster_id).\
+            filter(SecurityBase.name==name)
+        
+        key = query.one()
+
+        return key.username, self.server.decrypt(key.password)
+
+    def get_runs(self) -> 'int':
+        """ 
+        Returns the number of runs that will be used for excuting the quantum task. 
+        By default it will be used 1000 runs
+        """
+        if(self.runs == None):
+            runs = getattr(self.__class__, 'runs', 1000)
+        else:
+            runs = self.runs
+        return runs
+    
+    # ################################################################################################################################
+    
+    def get_quantum_computer_name(self) -> 'str':
+        """ Returns the quantum computer name that will be used for excuting the quantum task. 
+        """
+
+        if(self.quantum_computer == None):
+            computer = getattr(self.__class__, 'quantum_computer', '')
+        else:
+            computer = self.quantum_computer
+
+        return computer
+    
+    # ################################################################################################################################
+    
+    def get_timeout(self) -> 'int':
+        """ Returns the timeout time in seconds that will be used for excuting the quantum task. 
+        By default it will be 5 days in seconds
+        """
+
+        if(self.timeout == None):
+            timeout = getattr(self.__class__, 'timeout', 5*24*60*60)
+        else:
+            timeout = self.timeout
+
+        return timeout
+    
+    # ################################################################################################################################
+    
+    def get_confidence_threshold(self) -> 'float':
+        """ Returns the confidence threshold that will be expected from excuting the quantum task. 
+        By default it will be set to 0.5 (50%)
+        """
+        if(self.confidence_threshold == None):
+            threshold = getattr(self.__class__, 'threshold', 0.5)
+        else:
+            threshold = self.confidence_threshold
+            
+
+        return threshold
+    
+    # ################################################################################################################################
+    
+    def __init__(self, *ignored_args: any_, **ignored_kwargs: any_) -> None:
+        super().__init__(*ignored_args, **ignored_kwargs)
+        self.circuit_result = None
+        self.key = None
+        self.runs = None
+        self.quantum_computer = None
+        self.timeout = None
+        self.confidence_threshold = None
+    
+    
+    # ################################################################################################################################
+
+    def invoke(self, zato_name:'any_', *args:'any_', **kwargs:'any_') -> 'any_':
+        """ Invokes a service synchronously by its name.
+        """
+        # The 'zato_name' parameter is actually a service class,
+        # not its name, and we need to extract the name ourselves.
+
+        self.runs = kwargs.get('runs', None)
+        self.key = kwargs.get('key', None)
+        self.quantum_computer = kwargs.get('quantum_computer', None)
+        self.timeout = kwargs.get('timeout', None)
+        self.confidence_threshold = kwargs.get('confidence_threshold', None)
+
+        if isclass(zato_name) and issubclass(zato_name, Service): # type: Service
+            zato_name = zato_name.get_name()
+
+        if self.component_enabled_target_matcher:
+            zato_name, target = self.extract_target(zato_name) # type: ignore
+            kwargs['target'] = target
+
+        if self._enforce_service_invokes and self.invokes:
+            if zato_name not in self.invokes:
+                msg = 'Could not invoke `{}` which is not in `{}`'.format(zato_name, self.invokes)
+                self.logger.warning(msg)
+                raise ValueError(msg)
+
+        return self.invoke_by_impl_name(self.server.service_store.name_to_impl_name[zato_name], *args, **kwargs)
+
+    # ################################################################################################################################
+
+    def invoke_async(
+        self,
+        name,       # type: str
+        payload='', # type: str
+        channel=CHANNEL.INVOKE_ASYNC, # type: str
+        data_format=DATA_FORMAT.DICT, # type: str
+        transport='', # type: str
+        expiration=BROKER.DEFAULT_EXPIRATION, # type: int
+        to_json_string=False, # type: bool
+        cid='',        # type: str
+        callback=None, # type: str | Service | None
+        zato_ctx=None, # type: stranydict | None
+        environ=None,   # type: stranydict | None
+        runs=None,      # type: int | None
+        key=None,       # type: str | None
+        quantum_computer=None, # type: str | None
+        timeout=None,    # type: str | None
+        confidence_threshold=None # type: float | None
+
+    ) -> 'str':
+        """ Invokes a service asynchronously by its name.
+        """
+
+        self.runs = runs
+        self.key = key
+        self.quantum_computer = quantum_computer
+        self.timeout = timeout
+        self.confidence_threshold = confidence_threshold
+
+        zato_ctx = zato_ctx if zato_ctx is not None else {}
+        environ = environ if environ is not None else {}
+
+        if self.component_enabled_target_matcher:
+            name, target = self.extract_target(name)
+            zato_ctx['zato.request_ctx.target'] = target
+        else:
+            target = None
+
+        # Let's first find out if the service can be invoked at all
+        impl_name = self.server.service_store.name_to_impl_name[name]
+
+        if self.component_enabled_invoke_matcher:
+            if not self._worker_store.invoke_matcher.is_allowed(impl_name):
+                raise ZatoException(self.cid, 'Service `{}` (impl_name) cannot be invoked'.format(impl_name))
+
+        if to_json_string:
+            payload = dumps(payload)
+
+        cid = cid or new_cid()
+
+        # If there is any callback at all, we need to figure out its name because that's how it will be invoked by.
+        if callback:
+
+            # The same service
+            if callback is self:
+                callback = self.name
+
+        else:
+            sink = '{}-async-callback'.format(self.name)
+            if sink in self.server.service_store.name_to_impl_name:
+                callback = sink
+
+            else:
+                # Otherwise the callback must be a string pointing to the actual service to reply to
+                # so we do not need to do anything.
+                pass
+
+        async_ctx = AsyncCtx()
+        async_ctx.calling_service = self.name
+        async_ctx.service_name = name
+        async_ctx.cid = cid
+        async_ctx.data = payload
+        async_ctx.data_format = data_format
+        async_ctx.zato_ctx = zato_ctx
+        async_ctx.environ = environ
+
+        if callback:
+            async_ctx.callback = list(callback) if isinstance(callback, (list, tuple)) else [callback]
+
+        spawn_greenlet(self._invoke_async, async_ctx, channel)
+
+        return cid
+    
+    # ################################################################################################################################
+        
+    @abstractmethod
+    def circuit(self) -> 'QuantumCircuit | Circuit':
+        """ The method that describes the quantum circuit that will be excecuted. It must return the circuit definition"""
+        raise NotImplementedError('Should be overridden by subclasses (QuantumService.circuit)')
+    
+    # ################################################################################################################################
+    
+    @abstractmethod
+    def before_circuit_execution(self, _zato_no_op_marker=zato_no_op_marker, *args, **kwargs): # type: ignore
+        """ Invoked just before the actual service executes the quantum circuit.
+        """
+
+    # ################################################################################################################################
+        
+    @abstractmethod
+    def after_circuit_execution(self, _zato_no_op_marker=zato_no_op_marker, *args, **kwargs): # type: ignore
+        """ Invoked just after the actual service executes the quantum circuit. \n
+        The implementation of this method is required \n
+        The result of the circuit execution it's in :mod:`self.circuit_result`
+        """
+        raise NotImplementedError('Should be overridden by subclasses (QuantumService.after_circuit_execution)')
+
+# ################################################################################################################################
+
+class AWSQuantumService(QuantumService):
+    """ 
+    A base class for all quantum services deployed on Zato servers that uses AWS and Braket. \n
+    All its subclasses must implement at least the :mod:`circuit` and :mod:`after_circuit_execution` methods. \n
+    If synchronization logic it's needed before or after the circuit execution, it can be specified in the methods :mod:`before_circuit_execution` and :mod:`after_circuit_exectuion`respectively.
+    """
+
+    circuit_result : 'GateModelQuantumTaskResult | AnnealingQuantumTaskResult | PhotonicModelQuantumTaskResult'
+
+    @classmethod
+    def get_aws_region(class_:'type[AWSQuantumService]') -> 'str':
+        """ Returns the AWS Region that will be used for excuting the quantum task. 
+        By default it will be used us-east-1.
+        """
+        region = getattr(class_, 'aws_region', 'us-east-1')
+
+        return region
+    
+    # ################################################################################################################################
+
+    def handle(self) -> None:
+        if self.before_circuit_execution:
+            self.before_circuit_execution()
+        
+        circuit = self.circuit()
+        key_id, access_key = self.get_key()
+        session = Session(aws_access_key_id=key_id, aws_secret_access_key=access_key, region_name=self.get_aws_region())
+        aws_session = AwsSession(boto_session=session)
+        device = AwsDevice(self.get_quantum_computer_name(), aws_session=aws_session)
+
+        task = device.run(circuit, shots=self.get_runs(), poll_timeout_seconds=self.get_timeout())
+        result = task.result()
+        if (result == None):
+            msg = 'The task did not complete correctly or timed out, name:[{}]'.format(self.name)
+            self.logger.error(msg)
+            raise ZatoException(self.cid, msg)
+        
+        threshold_reached = False
+
+        for probabilities in result.measurement_probabilities.values():
+            if (probabilities > self.get_confidence_threshold()):
+                threshold_reached = True
+           
+        if not threshold_reached:
+            msg = 'The task did not pass the specified confidence threshold, name:[{}]'.format(self.name)
+            self.logger.error(msg)
+            raise ZatoException(self.cid, msg)
+        
+        self.circuit_result = result
+        self.after_circuit_execution()
+
+    # ################################################################################################################################
+
+    def circuit(self) -> 'Circuit':
+        """ The method that describes the quantum circuit that will be excecuted. It must return the circuit definition"""
+        raise NotImplementedError('Should be overridden by subclasses (AWSQuantumService.circuit)')
+      
+# ################################################################################################################################
+
+class IBMQuantumService(QuantumService):
+    """ 
+    A base class for all quantum services deployed on Zato servers that uses IBM and Quiskit. \n
+    All its subclasses must implement at least the :mod:`circuit` and :mod:`after_circuit_execution` methods. \n
+    If synchronization logic it's needed before or after the circuit execution, it can be specified in the methods :mod:`before_circuit_execution` and :mod:`after_circuit_exectuion`respectively.
+    """
+
+    circuit_result : 'Result'
+    
+    # ################################################################################################################################
+
+    def handle(self) -> None:
+        if self.before_circuit_execution:
+            self.before_circuit_execution()
+        
+        circuit = self.circuit()
+        key_id, api_key = self.get_key()
+        provider = IBMProvider(token=api_key)
+        try:
+            backend = provider.get_backend(self.get_quantum_computer_name())
+        except QiskitBackendNotFoundError:
+            msg = 'The computer introduced does not exists, name:[{}]'.format(self.name)
+            self.logger.error(msg)
+            raise ZatoException(self.cid, msg)
+        
+        transpiled_circuit = transpile(circuit, backend=backend)
+        job = backend.run(transpiled_circuit, shots=self.get_runs())
+        try:
+            result = job.result(timeout=self.get_timeout())
+        except IBMJobFailureError:
+            msg = 'The task did not complete correctly, name:[{}]'.format(self.name)
+            self.logger.error(msg)
+            raise ZatoException(self.cid, msg)
+        except IBMJobTimeoutError:
+            msg = 'The task did timed out, name:[{}]'.format(self.name)
+            self.logger.error(msg)
+            raise ZatoException(self.cid, msg)
+        
+        threshold_reached = False
+
+        for count in result.get_counts().values():
+            if ((count/self.get_runs()) > self.get_confidence_threshold()):
+                threshold_reached = True
+           
+        if not threshold_reached:
+            msg = 'The task did not pass the specified confidence threshold, name:[{}]'.format(self.name)
+            self.logger.error(msg)
+            raise ZatoException(self.cid, msg)
+        
+        self.circuit_result = result
+        self.after_circuit_execution()
+
+    # ################################################################################################################################
+
+    def circuit(self) -> 'QuantumCircuit':
+        """ The method that describes the quantum circuit that will be excecuted. It must return the circuit definition"""
+        raise NotImplementedError('Should be overridden by subclasses (IBMQuantumService.circuit)')
+      
 # ################################################################################################################################
 
 class _Hook(Service):
