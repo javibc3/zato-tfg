@@ -18,6 +18,7 @@ from typing import Optional as optional
 
 # Amazon Braket SDK
 from braket.circuits.circuit import Circuit
+from braket.devices import LocalSimulator
 from braket.aws.aws_device import AwsDevice, AwsSession
 from braket.tasks.gate_model_quantum_task_result import GateModelQuantumTaskResult
 from braket.tasks.annealing_quantum_task_result import AnnealingQuantumTaskResult
@@ -1472,12 +1473,12 @@ class QuantumService(Service, metaclass=ABCMeta):
     
     # ################################################################################################################################
     
-    def get_confidence_threshold(self) -> 'float':
+    def get_confidence_threshold(self) -> 'float | None':
         """ Returns the confidence threshold that will be expected from excuting the quantum task. 
-        By default it will be set to 0.5 (50%)
+        By default it will be set to None and will not be taken in consideration for the execution of the task.
         """
         if(self.confidence_threshold == None):
-            threshold = getattr(self.__class__, 'threshold', 0.5)
+            threshold = getattr(self.__class__, 'threshold', None)
         else:
             threshold = self.confidence_threshold
             
@@ -1498,17 +1499,17 @@ class QuantumService(Service, metaclass=ABCMeta):
     
     # ################################################################################################################################
 
-    def invoke(self, zato_name:'any_', *args:'any_', **kwargs:'any_') -> 'any_':
+    def invoke(self, zato_name:'any_',runs=None, key=None, quantum_computer=None, timeout=None, confidence_threshold=None, *args:'any_', **kwargs:'any_') -> 'any_':
         """ Invokes a service synchronously by its name.
         """
         # The 'zato_name' parameter is actually a service class,
         # not its name, and we need to extract the name ourselves.
 
-        self.runs = kwargs.get('runs', None)
-        self.key = kwargs.get('key', None)
-        self.quantum_computer = kwargs.get('quantum_computer', None)
-        self.timeout = kwargs.get('timeout', None)
-        self.confidence_threshold = kwargs.get('confidence_threshold', None)
+        self.runs = runs
+        self.key = key
+        self.quantum_computer = quantum_computer
+        self.timeout = timeout
+        self.confidence_threshold = confidence_threshold
 
         if isclass(zato_name) and issubclass(zato_name, Service): # type: Service
             zato_name = zato_name.get_name()
@@ -1663,9 +1664,15 @@ class AWSQuantumService(QuantumService):
         key_id, access_key = self.get_key()
         session = Session(aws_access_key_id=key_id, aws_secret_access_key=access_key, region_name=self.get_aws_region())
         aws_session = AwsSession(boto_session=session)
-        device = AwsDevice(self.get_quantum_computer_name(), aws_session=aws_session)
+        if(self.get_quantum_computer_name() == 'LocalSimulator'):
+            device = LocalSimulator()
+        else:
+            device = AwsDevice(self.get_quantum_computer_name(), aws_session=aws_session)
 
-        task = device.run(circuit, shots=self.get_runs(), poll_timeout_seconds=self.get_timeout())
+        if(self.get_quantum_computer_name() == 'LocalSimulator'):
+            task = device.run(circuit, shots=self.get_runs())
+        else:
+            task = device.run(circuit, shots=self.get_runs(), poll_timeout_seconds=self.get_timeout())
         result = task.result()
         if (result == None):
             msg = 'The task did not complete correctly or timed out, name:[{}]'.format(self.name)
@@ -1674,14 +1681,15 @@ class AWSQuantumService(QuantumService):
         
         threshold_reached = False
 
-        for probabilities in result.measurement_probabilities.values():
-            if (probabilities > self.get_confidence_threshold()):
-                threshold_reached = True
-           
-        if not threshold_reached:
-            msg = 'The task did not pass the specified confidence threshold, name:[{}]'.format(self.name)
-            self.logger.error(msg)
-            raise ZatoException(self.cid, msg)
+        if self.get_confidence_threshold() != None:
+            for probabilities in result.measurement_probabilities.values():
+                if (probabilities > self.get_confidence_threshold()):
+                    threshold_reached = True
+            
+            if not threshold_reached:
+                msg = 'The task did not pass the specified confidence threshold, name:[{}]'.format(self.name)
+                self.logger.error(msg)
+                raise ZatoException(self.cid, msg)
         
         self.circuit_result = result
         self.after_circuit_execution()
@@ -1720,7 +1728,7 @@ class IBMQuantumService(QuantumService):
             raise ZatoException(self.cid, msg)
         
         transpiled_circuit = transpile(circuit, backend=backend)
-        job = backend.run(transpiled_circuit, shots=self.get_runs())
+        job = backend.run(transpiled_circuit, shots=self.get_runs(), memory=True)
         try:
             result = job.result(timeout=self.get_timeout())
         except IBMJobFailureError:
@@ -1734,14 +1742,15 @@ class IBMQuantumService(QuantumService):
         
         threshold_reached = False
 
-        for count in result.get_counts().values():
-            if ((count/self.get_runs()) > self.get_confidence_threshold()):
-                threshold_reached = True
-           
-        if not threshold_reached:
-            msg = 'The task did not pass the specified confidence threshold, name:[{}]'.format(self.name)
-            self.logger.error(msg)
-            raise ZatoException(self.cid, msg)
+        if self.get_confidence_threshold() != None:
+            for count in result.get_counts().values():
+                if ((count/self.get_runs()) > self.get_confidence_threshold()):
+                    threshold_reached = True
+            
+            if not threshold_reached:
+                msg = 'The task did not pass the specified confidence threshold, name:[{}]'.format(self.name)
+                self.logger.error(msg)
+                raise ZatoException(self.cid, msg)
         
         self.circuit_result = result
         self.after_circuit_execution()
