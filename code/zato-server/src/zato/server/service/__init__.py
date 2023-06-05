@@ -941,6 +941,10 @@ class Service:
         as_bunch=False,     # type: bool
         timeout=0,          # type: int
         raise_timeout=True, # type: bool
+        runs=None,          # type: int
+        threshold=None,     # type: float
+        quantum_computer=None, # type: str
+        timeout_quantum=None,  # type: int
         **kwargs:'any_'
     ) -> 'any_':
         """ Invokes a service synchronously by its implementation name (full dotted Python name).
@@ -969,6 +973,12 @@ class Service:
         if not is_active:
             raise Inactive(service.get_name())
 
+        if issubclass(service.__class__, QuantumService):
+            service.runs = runs
+            service.threshold = threshold
+            service.quantum_computer = quantum_computer
+            service.timeout = timeout_quantum
+        
         # If there is no payload but there are keyword arguments other than what we expect internally,
         # we can turn them into a payload ourselves.
         if not payload:
@@ -1053,7 +1063,11 @@ class Service:
         cid='',        # type: str
         callback=None, # type: str | Service | None
         zato_ctx=None, # type: stranydict | None
-        environ=None   # type: stranydict | None
+        environ=None,   # type: stranydict | None
+        runs=None,          # type: int
+        threshold=None,     # type: float
+        quantum_computer=None, # type: str
+        timeout_quantum=None,  # type: int
     ) -> 'str':
         """ Invokes a service asynchronously by its name.
         """
@@ -1108,7 +1122,7 @@ class Service:
         if callback:
             async_ctx.callback = list(callback) if isinstance(callback, (list, tuple)) else [callback]
 
-        spawn_greenlet(self._invoke_async, async_ctx, channel)
+        spawn_greenlet(self._invoke_async, async_ctx, channel, runs, threshold, quantum_computer, timeout_quantum)
 
         return cid
 
@@ -1118,11 +1132,15 @@ class Service:
         self,
         ctx,     # type: AsyncCtx
         channel, # type: str
+        runs,          # type: int
+        threshold,     # type: float
+        quantum_computer, # type: str
+        timeout_quantum,  # type: int
         _async_callback=_async_callback, # type: Service | str
     ) -> 'None':
 
         # Invoke our target service ..
-        response = self.invoke(ctx.service_name, ctx.data, data_format=ctx.data_format, channel=channel, skip_response_elem=True)
+        response = self.invoke(ctx.service_name, ctx.data, runs=runs, threshold=threshold, quantum_computer=quantum_computer, timeout_quantum=timeout_quantum, data_format=ctx.data_format, channel=channel, skip_response_elem=True)
 
         # .. and report back the response to our callback(s), if there are any.
         if ctx.callback:
@@ -1495,121 +1513,6 @@ class QuantumService(Service, metaclass=ABCMeta):
         self.quantum_computer = None
         self.timeout = None
         self.confidence_threshold = None
-    
-    
-    # ################################################################################################################################
-
-    def invoke(self, zato_name:'any_',runs=None, key=None, quantum_computer=None, timeout=None, confidence_threshold=None, *args:'any_', **kwargs:'any_') -> 'any_':
-        """ Invokes a service synchronously by its name.
-        """
-        # The 'zato_name' parameter is actually a service class,
-        # not its name, and we need to extract the name ourselves.
-
-        self.runs = runs
-        self.key = key
-        self.quantum_computer = quantum_computer
-        self.timeout = timeout
-        self.confidence_threshold = confidence_threshold
-
-        if isclass(zato_name) and issubclass(zato_name, Service): # type: Service
-            zato_name = zato_name.get_name()
-
-        if self.component_enabled_target_matcher:
-            zato_name, target = self.extract_target(zato_name) # type: ignore
-            kwargs['target'] = target
-
-        if self._enforce_service_invokes and self.invokes:
-            if zato_name not in self.invokes:
-                msg = 'Could not invoke `{}` which is not in `{}`'.format(zato_name, self.invokes)
-                self.logger.warning(msg)
-                raise ValueError(msg)
-
-        return self.invoke_by_impl_name(self.server.service_store.name_to_impl_name[zato_name], *args, **kwargs)
-
-    # ################################################################################################################################
-
-    def invoke_async(
-        self,
-        name,       # type: str
-        payload='', # type: str
-        channel=CHANNEL.INVOKE_ASYNC, # type: str
-        data_format=DATA_FORMAT.DICT, # type: str
-        transport='', # type: str
-        expiration=BROKER.DEFAULT_EXPIRATION, # type: int
-        to_json_string=False, # type: bool
-        cid='',        # type: str
-        callback=None, # type: str | Service | None
-        zato_ctx=None, # type: stranydict | None
-        environ=None,   # type: stranydict | None
-        runs=None,      # type: int | None
-        key=None,       # type: str | None
-        quantum_computer=None, # type: str | None
-        timeout=None,    # type: str | None
-        confidence_threshold=None # type: float | None
-
-    ) -> 'str':
-        """ Invokes a service asynchronously by its name.
-        """
-
-        self.runs = runs
-        self.key = key
-        self.quantum_computer = quantum_computer
-        self.timeout = timeout
-        self.confidence_threshold = confidence_threshold
-
-        zato_ctx = zato_ctx if zato_ctx is not None else {}
-        environ = environ if environ is not None else {}
-
-        if self.component_enabled_target_matcher:
-            name, target = self.extract_target(name)
-            zato_ctx['zato.request_ctx.target'] = target
-        else:
-            target = None
-
-        # Let's first find out if the service can be invoked at all
-        impl_name = self.server.service_store.name_to_impl_name[name]
-
-        if self.component_enabled_invoke_matcher:
-            if not self._worker_store.invoke_matcher.is_allowed(impl_name):
-                raise ZatoException(self.cid, 'Service `{}` (impl_name) cannot be invoked'.format(impl_name))
-
-        if to_json_string:
-            payload = dumps(payload)
-
-        cid = cid or new_cid()
-
-        # If there is any callback at all, we need to figure out its name because that's how it will be invoked by.
-        if callback:
-
-            # The same service
-            if callback is self:
-                callback = self.name
-
-        else:
-            sink = '{}-async-callback'.format(self.name)
-            if sink in self.server.service_store.name_to_impl_name:
-                callback = sink
-
-            else:
-                # Otherwise the callback must be a string pointing to the actual service to reply to
-                # so we do not need to do anything.
-                pass
-
-        async_ctx = AsyncCtx()
-        async_ctx.calling_service = self.name
-        async_ctx.service_name = name
-        async_ctx.cid = cid
-        async_ctx.data = payload
-        async_ctx.data_format = data_format
-        async_ctx.zato_ctx = zato_ctx
-        async_ctx.environ = environ
-
-        if callback:
-            async_ctx.callback = list(callback) if isinstance(callback, (list, tuple)) else [callback]
-
-        spawn_greenlet(self._invoke_async, async_ctx, channel)
-
-        return cid
     
     # ################################################################################################################################
         
