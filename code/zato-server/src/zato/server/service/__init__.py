@@ -1545,6 +1545,30 @@ class QuantumService(Service, metaclass=ABCMeta):
         self.repeat_count = 1
     
     # ################################################################################################################################
+
+    def handle(self) -> None:
+        if self.before_circuit_execution:
+            self.before_circuit_execution()
+        
+        result = self.circuit_execution()
+        
+        if self.get_confidence_threshold() != None:
+            threshold_reached = self.threshold_check(result=result)
+            
+            if not threshold_reached and not self.get_repeat_on_failure():
+                msg = 'The task did not pass the specified confidence threshold, name:[{}]'.format(self.name)
+                self.logger.error(msg)
+                raise ZatoException(self.cid, msg)
+            elif not threshold_reached and self.get_repeat_on_failure():
+                count = self.get_repeat_count()
+                while (not threshold_reached and count > 0):
+                    result = self.circuit_execution()
+                    threshold_reached = self.threshold_check(result=result)
+                    count -= 1
+        self.circuit_result = result
+        self.after_circuit_execution()
+
+    # ################################################################################################################################
         
     @abstractmethod
     def circuit(self) -> 'QuantumCircuit | Circuit':
@@ -1634,30 +1658,6 @@ class AWSQuantumService(QuantumService):
 
     # ################################################################################################################################
 
-    def handle(self) -> None:
-        if self.before_circuit_execution:
-            self.before_circuit_execution()
-        
-        result = self.circuit_execution()
-        
-        if self.get_confidence_threshold() != None:
-            threshold_reached = self.threshold_check(result=result)
-            
-            if not threshold_reached and not self.get_repeat_on_failure():
-                msg = 'The task did not pass the specified confidence threshold, name:[{}]'.format(self.name)
-                self.logger.error(msg)
-                raise ZatoException(self.cid, msg)
-            elif not threshold_reached and self.get_repeat_on_failure():
-                count = self.get_repeat_count()
-                while (not threshold_reached and count > 0):
-                    result = self.circuit_execution()
-                    threshold_reached = self.threshold_check(result=result)
-                    count -= 1
-        self.circuit_result = result
-        self.after_circuit_execution()
-
-    # ################################################################################################################################
-
     def circuit(self) -> 'Circuit':
         """ The method that describes the quantum circuit that will be excecuted. It must return the circuit definition"""
         raise NotImplementedError('Should be overridden by subclasses (AWSQuantumService.circuit)')
@@ -1710,30 +1710,6 @@ class IBMQuantumService(QuantumService):
 
     # ################################################################################################################################
     
-    def handle(self) -> None:
-        if self.before_circuit_execution:
-            self.before_circuit_execution()
-        
-        result = self.circuit_execution()
-        
-        if self.get_confidence_threshold() != None:
-            threshold_reached = self.threshold_check(result=result)
-            
-            if not threshold_reached and not self.get_repeat_on_failure():
-                msg = 'The task did not pass the specified confidence threshold, name:[{}]'.format(self.name)
-                self.logger.error(msg)
-                raise ZatoException(self.cid, msg)
-            elif not threshold_reached and self.get_repeat_on_failure():
-                count = self.get_repeat_count()
-                while (not threshold_reached and count > 0):
-                    result = self.circuit_execution()
-                    threshold_reached = self.threshold_check(result=result)
-                    count -= 1
-        self.circuit_result = result
-        self.after_circuit_execution()
-
-    # ################################################################################################################################
-
     def circuit(self) -> 'QuantumCircuit':
         """ The method that describes the quantum circuit that will be excecuted. It must return the circuit definition"""
         raise NotImplementedError('Should be overridden by subclasses (IBMQuantumService.circuit)')
