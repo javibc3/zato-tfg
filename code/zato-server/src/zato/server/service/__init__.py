@@ -1502,6 +1502,34 @@ class QuantumService(Service, metaclass=ABCMeta):
             
 
         return threshold
+
+    # ################################################################################################################################
+
+    def get_repeat_on_failure(self) -> 'bool':
+        """ Returns whether the service should be re-executed if the confidence threshold has not been exceeded. 
+        By default it is set to False.
+        """
+        if(self.repeat_on_failure == None):
+            repeat_on_failure = getattr(self.__class__, 'repeat_on_failure', False)
+        else:
+            repeat_on_failure = self.repeat_on_failure
+            
+
+        return repeat_on_failure
+    
+    # ################################################################################################################################
+
+    def get_repeat_count(self) -> 'int':
+        """ Returns the limit of repetition when failing to exceed the confidence threshold. 
+        By default it is set to 1.
+        """
+        if(self.repeat_count == None):
+            repeat_count = getattr(self.__class__, 'repeat_count', 1)
+        else:
+            repeat_count = self.repeat_count
+            
+
+        return repeat_count
     
     # ################################################################################################################################
     
@@ -1513,6 +1541,8 @@ class QuantumService(Service, metaclass=ABCMeta):
         self.quantum_computer = None
         self.timeout = None
         self.confidence_threshold = None
+        self.repeat_on_failure = False
+        self.repeat_count = 1
     
     # ################################################################################################################################
         
@@ -1537,6 +1567,20 @@ class QuantumService(Service, metaclass=ABCMeta):
         """
         raise NotImplementedError('Should be overridden by subclasses (QuantumService.after_circuit_execution)')
 
+    @abstractmethod
+    def circuit_execution(self) -> 'Result | GateModelQuantumTaskResult | AnnealingQuantumTaskResult | PhotonicModelQuantumTaskResult':
+        """
+        Method that contains the code responsible for configuring and executes the quantum circuit specified.
+        """
+        raise NotImplementedError('Should be overridden by subclasses (QuantumService.__circuit_exection')
+    
+    @abstractmethod
+    def threshold_check(self, result) -> 'bool':
+        """
+        Method that contains the code responsible for checking if the result exceeds the threshold defined in the service.
+        """
+        raise NotImplementedError('Should be overridden by subclasses (QuantumService.__circuit_exection')
+
 # ################################################################################################################################
 
 class AWSQuantumService(QuantumService):
@@ -1559,10 +1603,15 @@ class AWSQuantumService(QuantumService):
     
     # ################################################################################################################################
 
-    def handle(self) -> None:
-        if self.before_circuit_execution:
-            self.before_circuit_execution()
-        
+    def threshold_check(self, result) -> 'bool':
+        for probabilities in result.measurement_probabilities.values():
+                if (probabilities > self.get_confidence_threshold()):
+                    threshold_reached = True
+        return threshold_reached
+
+    # ################################################################################################################################
+
+    def circuit_execution(self) -> 'GateModelQuantumTaskResult | AnnealingQuantumTaskResult | PhotonicModelQuantumTaskResult':
         circuit = self.circuit()
         key_id, access_key = self.get_key()
         session = Session(aws_access_key_id=key_id, aws_secret_access_key=access_key, region_name=self.get_aws_region())
@@ -1581,19 +1630,29 @@ class AWSQuantumService(QuantumService):
             msg = 'The task did not complete correctly or timed out, name:[{}]'.format(self.name)
             self.logger.error(msg)
             raise ZatoException(self.cid, msg)
-        
-        threshold_reached = False
+        return result
 
+    # ################################################################################################################################
+
+    def handle(self) -> None:
+        if self.before_circuit_execution:
+            self.before_circuit_execution()
+        
+        result = self.circuit_execution()
+        
         if self.get_confidence_threshold() != None:
-            for probabilities in result.measurement_probabilities.values():
-                if (probabilities > self.get_confidence_threshold()):
-                    threshold_reached = True
+            threshold_reached = self.threshold_check(result=result)
             
-            if not threshold_reached:
+            if not threshold_reached and not self.get_repeat_on_failure():
                 msg = 'The task did not pass the specified confidence threshold, name:[{}]'.format(self.name)
                 self.logger.error(msg)
                 raise ZatoException(self.cid, msg)
-        
+            elif not threshold_reached and self.get_repeat_on_failure():
+                count = self.get_repeat_count()
+                while (not threshold_reached and count > 0):
+                    result = self.circuit_execution()
+                    threshold_reached = self.threshold_check(result=result)
+                    count -= 1
         self.circuit_result = result
         self.after_circuit_execution()
 
@@ -1613,13 +1672,18 @@ class IBMQuantumService(QuantumService):
     """
 
     circuit_result : 'Result'
-    
+
     # ################################################################################################################################
 
-    def handle(self) -> None:
-        if self.before_circuit_execution:
-            self.before_circuit_execution()
-        
+    def threshold_check(self, result) -> 'bool':
+        for count in result.get_counts().values():
+                if ((count/self.get_runs()) > self.get_confidence_threshold()):
+                    threshold_reached = True
+        return threshold_reached
+
+    # ################################################################################################################################
+
+    def circuit_execution(self) -> 'Result':
         circuit = self.circuit()
         key_id, api_key = self.get_key()
         provider = IBMProvider(token=api_key)
@@ -1642,19 +1706,29 @@ class IBMQuantumService(QuantumService):
             msg = 'The task did timed out, name:[{}]'.format(self.name)
             self.logger.error(msg)
             raise ZatoException(self.cid, msg)
-        
-        threshold_reached = False
+        return result
 
+    # ################################################################################################################################
+    
+    def handle(self) -> None:
+        if self.before_circuit_execution:
+            self.before_circuit_execution()
+        
+        result = self.circuit_execution()
+        
         if self.get_confidence_threshold() != None:
-            for count in result.get_counts().values():
-                if ((count/self.get_runs()) > self.get_confidence_threshold()):
-                    threshold_reached = True
+            threshold_reached = self.threshold_check(result=result)
             
-            if not threshold_reached:
+            if not threshold_reached and not self.get_repeat_on_failure():
                 msg = 'The task did not pass the specified confidence threshold, name:[{}]'.format(self.name)
                 self.logger.error(msg)
                 raise ZatoException(self.cid, msg)
-        
+            elif not threshold_reached and self.get_repeat_on_failure():
+                count = self.get_repeat_count()
+                while (not threshold_reached and count > 0):
+                    result = self.circuit_execution()
+                    threshold_reached = self.threshold_check(result=result)
+                    count -= 1
         self.circuit_result = result
         self.after_circuit_execution()
 
